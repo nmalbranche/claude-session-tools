@@ -1,0 +1,282 @@
+#!/usr/bin/env python3
+"""Export Claude Code sessions as readable Markdown, optionally zipped.
+
+Sessions are matched by their tab title (the name shown in the sidebar) or by
+session id prefix. Titles are matched case-insensitively.
+
+Usage:
+  claude-session-export "UX mocks review" "!251 review" --zip ~/Downloads/review.zip
+  claude-session-export 38ab1584 --out ~/Downloads
+  claude-session-export --list
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+import zipfile
+from datetime import datetime
+from pathlib import Path
+
+PROJECTS = Path.home() / ".claude" / "projects"
+SYSTEM_REMINDER = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
+
+
+def load(jsonl: Path):
+    for line in jsonl.open(errors="replace"):
+        try:
+            yield json.loads(line)
+        except ValueError:
+            continue
+
+
+def meta(jsonl: Path):
+    """Title, cwd, branch and time span for a transcript."""
+    info = {
+        "id": jsonl.stem,
+        "custom": None,
+        "ai": None,
+        "cwd": None,
+        "branch": None,
+        "first": None,
+        "last": None,
+        "version": None,
+    }
+    for rec in load(jsonl):
+        t = rec.get("type")
+        if t == "custom-title":
+            info["custom"] = rec.get("customTitle") or info["custom"]
+        elif t == "ai-title":
+            info["ai"] = rec.get("aiTitle") or info["ai"]
+        elif t in ("user", "assistant"):
+            info["cwd"] = rec.get("cwd") or info["cwd"]
+            info["branch"] = rec.get("gitBranch") or info["branch"]
+            info["version"] = rec.get("version") or info["version"]
+            ts = rec.get("timestamp")
+            if ts:
+                info["first"] = info["first"] or ts
+                info["last"] = ts
+    info["title"] = info["custom"] or info["ai"] or jsonl.stem[:8]
+    return info
+
+
+def index():
+    rows = []
+    if not PROJECTS.is_dir():
+        return rows
+    for d in sorted(p for p in PROJECTS.iterdir() if p.is_dir()):
+        for jsonl in d.glob("*.jsonl"):
+            info = meta(jsonl)
+            info["path"] = jsonl
+            info["project"] = d.name
+            info["mtime"] = jsonl.stat().st_mtime
+            rows.append(info)
+    rows.sort(key=lambda r: r["mtime"], reverse=True)
+    return rows
+
+
+def resolve(needle: str, rows):
+    n = needle.strip().lower()
+    exact = [r for r in rows if (r["custom"] or "").strip().lower() == n]
+    if len(exact) == 1:
+        return exact[0], None
+    if len(exact) > 1:
+        return None, f"{needle!r} matches {len(exact)} sessions by title"
+    byid = [r for r in rows if r["id"].lower().startswith(n)]
+    if len(byid) == 1:
+        return byid[0], None
+    if len(byid) > 1:
+        return None, f"{needle!r} matches {len(byid)} session ids"
+    loose = [r for r in rows if n in (r["title"] or "").lower()]
+    if len(loose) == 1:
+        return loose[0], None
+    if len(loose) > 1:
+        names = ", ".join(repr(r["title"]) for r in loose[:5])
+        return None, f"{needle!r} is ambiguous: {names}"
+    return None, f"no session matching {needle!r}"
+
+
+def clock(ts):
+    if not ts:
+        return ""
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone().strftime("%Y-%m-%d %H:%M")
+    except ValueError:
+        return ts
+
+
+def clean(text: str) -> str:
+    text = SYSTEM_REMINDER.sub("", text or "")
+    return text.strip()
+
+
+def brief(value, limit=160) -> str:
+    s = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    s = " ".join(s.split())
+    return s[: limit - 1] + "…" if len(s) > limit else s
+
+
+def tool_line(block) -> str:
+    name = block.get("name", "tool")
+    args = block.get("input") or {}
+    if not isinstance(args, dict):
+        return f"`{name}`"
+    for key in ("file_path", "path", "command", "pattern", "prompt", "query", "url", "skill"):
+        if key in args:
+            return f"`{name}` — {brief(args[key])}"
+    return f"`{name}` — {brief(args)}" if args else f"`{name}`"
+
+
+def render(info, include_thinking=False, include_tools=True) -> str:
+    out = [f"# {info['title']}", ""]
+    out.append(f"- **Session id:** `{info['id']}`")
+    out.append(f"- **When:** {clock(info['first'])} → {clock(info['last'])}")
+    if info["cwd"]:
+        out.append(f"- **Working directory:** `{info['cwd']}`")
+    if info["branch"]:
+        out.append(f"- **Git branch:** `{info['branch']}`")
+    if info["ai"] and info["ai"] != info["title"]:
+        out.append(f"- **Auto-generated title:** {info['ai']}")
+    out.append(f"- **Claude Code:** {info['version'] or 'unknown'}")
+    out.append("")
+    note = "Tool calls are shown as one-line summaries; their output is omitted."
+    if not include_thinking:
+        note += " Internal reasoning is omitted."
+    out.append(f"> Exported transcript. {note}")
+    out.append("")
+    out.append("---")
+    out.append("")
+
+    def flush(pieces):
+        """Emit a run of pieces, collapsing consecutive tool calls into one block."""
+        if not pieces:
+            return
+        run = []
+        for kind, body in pieces:
+            if kind == "tool":
+                run.append(body)
+                continue
+            if run:
+                out.append(fold_tools(run))
+                out.append("")
+                run = []
+            out.append(body)
+            out.append("")
+        if run:
+            out.append(fold_tools(run))
+            out.append("")
+
+    def fold_tools(run):
+        label = f"{len(run)} tool call{'s' if len(run) != 1 else ''}"
+        lines = "\n".join(f"- {line}" for line in run)
+        if len(run) <= 3:
+            return lines
+        return f"<details><summary>{label}</summary>\n\n{lines}\n\n</details>"
+
+    turn = 0
+    pending = []
+    open_assistant = False
+
+    for rec in load(info["path"]):
+        t = rec.get("type")
+        if t not in ("user", "assistant"):
+            continue
+        content = rec.get("message", {}).get("content")
+        blocks = content if isinstance(content, list) else [{"type": "text", "text": content}]
+        pieces = []
+        for b in blocks:
+            if not isinstance(b, dict):
+                continue
+            bt = b.get("type")
+            if bt == "text":
+                text = clean(b.get("text", ""))
+                if text:
+                    pieces.append(("text", text))
+            elif bt == "thinking" and include_thinking:
+                text = clean(b.get("thinking", ""))
+                if text:
+                    pieces.append(("text", f"<details><summary>Reasoning</summary>\n\n{text}\n\n</details>"))
+            elif bt == "tool_use" and include_tools:
+                pieces.append(("tool", tool_line(b)))
+        if not pieces:
+            continue
+
+        if t == "assistant":
+            if not open_assistant:
+                flush(pending)
+                pending = []
+                out.append(f"### Claude — {clock(rec.get('timestamp'))}")
+                out.append("")
+                open_assistant = True
+            pending.extend(pieces)
+        else:
+            flush(pending)
+            pending = []
+            open_assistant = False
+            turn += 1
+            out.append(f"## {turn}. Nicolas — {clock(rec.get('timestamp'))}")
+            out.append("")
+            flush(pieces)
+
+    flush(pending)
+    return "\n".join(out) + "\n"
+
+
+def safe(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._!-]+", "-", name).strip("-") or "session"
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("names", nargs="*", help="session tab titles or id prefixes")
+    ap.add_argument("--list", action="store_true", help="list sessions and exit")
+    ap.add_argument("--out", default=str(Path.home() / "Downloads"), help="output directory")
+    ap.add_argument("--zip", dest="zip_path", help="also bundle the exports into this .zip")
+    ap.add_argument("--thinking", action="store_true", help="include internal reasoning")
+    ap.add_argument("--no-tools", action="store_true", help="omit tool-call lines")
+    args = ap.parse_args()
+
+    rows = index()
+    if args.list or not args.names:
+        for r in rows:
+            when = datetime.fromtimestamp(r["mtime"]).strftime("%Y-%m-%d %H:%M")
+            tag = f"  (auto: {r['ai']})" if r["custom"] and r["ai"] else ""
+            print(f"{r['id'][:8]}  {when}  {r['title']}{tag}")
+        return 0
+
+    picked, problems = [], []
+    for name in args.names:
+        row, err = resolve(name, rows)
+        if err:
+            problems.append(err)
+        else:
+            picked.append(row)
+    if problems:
+        for p in problems:
+            print(f"error: {p}", file=sys.stderr)
+        print("\nRun with --list to see available sessions.", file=sys.stderr)
+        return 1
+
+    outdir = Path(os.path.expanduser(args.out))
+    outdir.mkdir(parents=True, exist_ok=True)
+    written = []
+    for row in picked:
+        md = render(row, include_thinking=args.thinking, include_tools=not args.no_tools)
+        dest = outdir / f"{safe(row['title'])}.md"
+        dest.write_text(md)
+        written.append(dest)
+        print(f"wrote {dest}  ({len(md) // 1024}K)")
+
+    if args.zip_path:
+        zp = Path(os.path.expanduser(args.zip_path))
+        zp.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(zp, "w", zipfile.ZIP_DEFLATED) as z:
+            for f in written:
+                z.write(f, f.name)
+        print(f"zipped {len(written)} file(s) -> {zp}  ({zp.stat().st_size // 1024}K)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

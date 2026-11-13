@@ -1,0 +1,480 @@
+#!/usr/bin/env python3
+"""Interactively delete Claude Code session transcripts from disk.
+
+The VS Code extension only offers "Archive session", which hides a session
+behind a globalState key and leaves its files in place. This deletes them.
+
+Sessions already archived in the extension are hidden by default (they are
+not in the panel, so they are not what you are trying to prune). Sessions
+whose transcript holds only metadata rows — no user or assistant turn — are
+flagged "no messages": the extension recreated them after a delete, and they
+show in the panel but load nothing.
+
+Run from a VS Code terminal, it reloads the window afterwards so the panel's
+session list refreshes — see reload_window() for what that costs.
+
+Usage:
+  claude-empty-trash                    # sessions for the current working directory
+  claude-empty-trash --all              # sessions across every project
+  claude-empty-trash --dir <path>       # sessions for another project path
+  claude-empty-trash --list             # list only, never prompt
+  claude-empty-trash --include-archived # also show sessions archived in the panel
+  claude-empty-trash --sort time        # order by last modified instead of by name
+  claude-empty-trash --no-reload        # never reload the VS Code window
+  claude-empty-trash --purge-trash      # delete every session in a panel group named
+                                       # "Trash", unattended; only while VS Code is closed
+  claude-empty-trash --purge-trash --dry-run
+"""
+
+import argparse
+import json
+import os
+import shutil
+import sqlite3
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+PROJECTS = Path.home() / ".claude" / "projects"
+
+RELOAD_LOG = Path("/tmp/claude-empty-trash-reload.log")
+
+STATE_DBS = [
+    Path.home() / "Library/Application Support/Code/User/globalStorage/state.vscdb",
+    Path.home() / "Library/Application Support/Code - Insiders/User/globalStorage/state.vscdb",
+    Path.home() / ".config/Code/User/globalStorage/state.vscdb",
+    Path.home() / ".config/Code - Insiders/User/globalStorage/state.vscdb",
+]
+STATE_KEY = "Anthropic.claude-code"
+
+TRASH_GROUP = "Trash"
+PURGE_LOG = Path.home() / "Library/Logs/claude-empty-trash.log"
+
+TURN_TYPES = {"user", "assistant"}
+
+
+def slug(path: Path) -> str:
+    return str(path.resolve()).replace("/", "-")
+
+
+def archived_ids():
+    """Session ids the VS Code extension has archived (hidden from its panel).
+
+    Read-only, so it is safe while VS Code is running — but the extension keeps
+    globalState in memory and flushes periodically, so a very recent archive may
+    not be here yet.
+    """
+    for db in STATE_DBS:
+        if not db.is_file():
+            continue
+        try:
+            con = sqlite3.connect(f"file:{db}?mode=ro&immutable=1", uri=True)
+            row = con.execute(
+                "select value from ItemTable where key = ?", (STATE_KEY,)
+            ).fetchone()
+            con.close()
+        except sqlite3.Error:
+            continue
+        if not row:
+            continue
+        try:
+            state = json.loads(row[0])
+        except ValueError:
+            continue
+        hidden = state.get("hiddenSessionIds") or []
+        if isinstance(hidden, list):
+            return set(hidden), db
+    return set(), None
+
+
+def scan(jsonl: Path) -> dict:
+    """Title as the panel shows it, plus whether the transcript has any turns."""
+    custom = ai = summary = first_user = None
+    has_turn = False
+    try:
+        with jsonl.open(errors="replace") as fh:
+            for line in fh:
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                kind = rec.get("type")
+                if kind == "custom-title":
+                    custom = rec.get("customTitle") or custom
+                elif kind == "ai-title":
+                    ai = rec.get("aiTitle") or ai
+                elif kind == "summary" and not summary:
+                    summary = rec.get("summary")
+                elif kind in TURN_TYPES:
+                    has_turn = True
+                    if kind == "user" and first_user is None:
+                        content = rec.get("message", {}).get("content")
+                        if isinstance(content, str):
+                            first_user = content
+                        elif isinstance(content, list):
+                            for block in content:
+                                if isinstance(block, dict) and block.get("type") == "text":
+                                    first_user = block.get("text")
+                                    break
+    except OSError:
+        pass
+    named = custom or ai
+    text = named or summary or first_user or "(empty)"
+    return {
+        "title": " ".join(text.split())[:60],
+        "named": bool(named),
+        "has_turn": has_turn,
+    }
+
+
+def size_of(jsonl: Path, sidecar: Path) -> int:
+    total = jsonl.stat().st_size
+    if sidecar.is_dir():
+        for root, _, files in os.walk(sidecar):
+            for name in files:
+                try:
+                    total += (Path(root) / name).stat().st_size
+                except OSError:
+                    pass
+    return total
+
+
+def human(n: int) -> str:
+    for unit in ("B", "K", "M", "G"):
+        if n < 1024 or unit == "G":
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}G"
+
+
+def collect(dirs, hidden, include_archived):
+    rows, skipped = [], 0
+    for d in dirs:
+        for jsonl in d.glob("*.jsonl"):
+            if jsonl.stem in hidden and not include_archived:
+                skipped += 1
+                continue
+            sidecar = jsonl.with_suffix("")
+            info = scan(jsonl)
+            rows.append(
+                {
+                    "id": jsonl.stem,
+                    "jsonl": jsonl,
+                    "sidecar": sidecar,
+                    "project": d.name,
+                    "mtime": jsonl.stat().st_mtime,
+                    "bytes": size_of(jsonl, sidecar),
+                    "archived": jsonl.stem in hidden,
+                    **info,
+                }
+            )
+    return rows, skipped
+
+
+def order(rows, how):
+    if how == "time":
+        rows.sort(key=lambda r: r["mtime"], reverse=True)
+    else:
+        # Named sessions first, alphabetically; then the rest, newest first.
+        rows.sort(
+            key=lambda r: (
+                0 if r["named"] else 1,
+                r["title"].casefold() if r["named"] else "",
+                -r["mtime"],
+            )
+        )
+    return rows
+
+
+def vscode_app():
+    """(application name, process name) for the VS Code window we are running in."""
+    if os.environ.get("TERM_PROGRAM") != "vscode":
+        return None
+    marker = " ".join(
+        os.environ.get(k, "")
+        for k in ("VSCODE_GIT_ASKPASS_NODE", "VSCODE_GIT_ASKPASS_MAIN", "VSCODE_CWD")
+    )
+    if "Insiders" in marker:
+        return "Visual Studio Code - Insiders", "Code - Insiders"
+    return "Visual Studio Code", "Code"
+
+
+def reload_window(app: str, proc: str) -> None:
+    """Drive the command palette to Developer: Reload Window.
+
+    There is no shell-to-VS Code command channel — the `code` CLI only opens
+    files and manages extensions — so this is UI scripting, and it needs
+    Accessibility permission for VS Code (System Settings > Privacy & Security
+    > Accessibility). Detached and delayed, because the reload tears down the
+    terminal this script is printing to.
+    """
+    script = f"""
+delay 1
+tell application "{app}" to activate
+delay 0.5
+tell application "System Events" to tell process "{proc}"
+    keystroke "p" using {{command down, shift down}}
+    delay 0.4
+    keystroke "Developer: Reload Window"
+    delay 0.8
+    key code 36
+end tell
+"""
+    try:
+        log = RELOAD_LOG.open("w")
+    except OSError:
+        log = subprocess.DEVNULL
+    subprocess.Popen(
+        ["osascript", "-e", script],
+        stdout=log,
+        stderr=log,
+        start_new_session=True,
+    )
+
+
+def app_running(db: Path) -> bool:
+    """Whether the VS Code build that owns this state DB is running."""
+    proc = "Code - Insiders" if "Insiders" in str(db) else "Code"
+    out = subprocess.run(
+        ["ps", "-axo", "comm"], capture_output=True, text=True
+    ).stdout
+    return any(line.endswith(f".app/Contents/MacOS/{proc}") for line in out.splitlines())
+
+
+def purge_trash(dry_run: bool) -> int:
+    """Delete every session in a panel group named TRASH_GROUP and empty the group.
+
+    Runs only while VS Code is closed: then no session is open (so none is
+    flushed back to disk), and the state DB is not cached in memory (so the
+    emptied group is not overwritten on the next flush).
+    """
+    def log(msg):
+        line = f"{datetime.now():%Y-%m-%d %H:%M:%S} {msg}"
+        print(line)
+        if not dry_run:
+            with PURGE_LOG.open("a") as fh:
+                fh.write(line + "\n")
+
+    for db in STATE_DBS:
+        if not db.is_file():
+            continue
+        if app_running(db):
+            print(f"VS Code is running, skipping {db}")
+            continue
+        con = sqlite3.connect(db)
+        row = con.execute(
+            "select value from ItemTable where key = ?", (STATE_KEY,)
+        ).fetchone()
+        if not row:
+            con.close()
+            continue
+        state = json.loads(row[0])
+        changed = False
+        for key, groups in state.items():
+            if not key.startswith("sessionGroups:") or not isinstance(groups, list):
+                continue
+            for group in groups:
+                if group.get("name") != TRASH_GROUP or not group.get("sessionIds"):
+                    continue
+                for sid in group["sessionIds"]:
+                    # A session can sit in another project's folder if it was moved.
+                    for jsonl in PROJECTS.glob(f"*/{sid}.jsonl"):
+                        title = scan(jsonl)["title"]
+                        if dry_run:
+                            log(f"would delete {sid} {title}")
+                            continue
+                        jsonl.unlink()
+                        sidecar = jsonl.with_suffix("")
+                        if sidecar.is_dir():
+                            shutil.rmtree(sidecar)
+                        log(f"deleted {sid} {title}")
+                group["sessionIds"] = []
+                changed = True
+        if changed and not dry_run:
+            shutil.copy2(db, db.with_name(db.name + ".claude-trash.bak"))
+            con.execute(
+                "update ItemTable set value = ? where key = ?",
+                (json.dumps(state), STATE_KEY),
+            )
+            con.commit()
+        con.close()
+    return 0
+
+
+def parse_selection(raw: str, rows):
+    lowered = raw.strip().casefold()
+    if lowered in ("ghosts", "ghost"):
+        picked = [i for i, r in enumerate(rows, 1) if not r["has_turn"]]
+        return picked or None
+    picked = set()
+    for part in raw.replace(",", " ").split():
+        if "-" in part[1:]:
+            lo, _, hi = part.partition("-")
+            try:
+                picked.update(range(int(lo), int(hi) + 1))
+            except ValueError:
+                return None
+        else:
+            try:
+                picked.add(int(part))
+            except ValueError:
+                return None
+    if any(n < 1 or n > len(rows) for n in picked):
+        return None
+    return sorted(picked)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("--all", action="store_true", help="every project, not just this one")
+    ap.add_argument("--dir", help="project path to list sessions for")
+    ap.add_argument("--list", action="store_true", help="list only, do not prompt")
+    ap.add_argument(
+        "--include-archived",
+        action="store_true",
+        help="also show sessions already archived in the VS Code panel",
+    )
+    ap.add_argument(
+        "--sort",
+        choices=("name", "time"),
+        default="name",
+        help="name (default): named sessions alphabetically, then the rest newest first",
+    )
+    ap.add_argument(
+        "--no-reload",
+        action="store_true",
+        help="do not reload the VS Code window after deleting",
+    )
+    ap.add_argument(
+        "--purge-trash",
+        action="store_true",
+        help=f'delete every session in the "{TRASH_GROUP}" panel group (VS Code must be closed)',
+    )
+    ap.add_argument("--dry-run", action="store_true", help="with --purge-trash, list only")
+    args = ap.parse_args()
+
+    if not PROJECTS.is_dir():
+        print(f"No session store at {PROJECTS}")
+        return 1
+
+    if args.purge_trash:
+        return purge_trash(args.dry_run)
+
+    if args.all:
+        dirs = sorted(p for p in PROJECTS.iterdir() if p.is_dir())
+        scope = "all projects"
+    else:
+        target = Path(args.dir) if args.dir else Path.cwd()
+        d = PROJECTS / slug(target)
+        if not d.is_dir():
+            print(f"No sessions recorded for {target}")
+            return 0
+        dirs = [d]
+        scope = str(target)
+
+    hidden, db = archived_ids()
+    rows, skipped = collect(dirs, hidden, args.include_archived)
+    if not rows:
+        extra = f" ({skipped} archived, hidden)" if skipped else ""
+        print(f"No sessions for {scope}{extra}")
+        return 0
+    order(rows, args.sort)
+
+    live = os.environ.get("CLAUDE_SESSION_ID")
+    print(f"\nClaude Code sessions — {scope}\n")
+    width = len(str(len(rows)))
+    title_w = max(len(r["title"]) for r in rows)
+    ghosts = 0
+    for i, r in enumerate(rows, 1):
+        when = datetime.fromtimestamp(r["mtime"]).strftime("%Y-%m-%d %H:%M")
+        mark = " *" if r["id"] == live else "  "
+        prefix = f"[{r['project']}] " if args.all else ""
+        flags = ""
+        if not r["has_turn"]:
+            flags += "  [no messages]"
+            ghosts += 1
+        if r["archived"]:
+            flags += "  [archived]"
+        print(
+            f"{i:>{width}}.{mark} {prefix}{r['title']:<{title_w}}  "
+            f"{when}  {human(r['bytes']):>7}  {r['id'][:8]}{flags}"
+        )
+
+    notes = []
+    if live and any(r["id"] == live for r in rows):
+        notes.append("  * = the session you are running in right now")
+    if skipped:
+        notes.append(f"  {skipped} archived session(s) hidden — pass --include-archived to show them")
+    if db is None:
+        notes.append("  could not read the VS Code state DB, so archived sessions are not known")
+    if ghosts:
+        notes.append(
+            f"  {ghosts} session(s) have no messages — the extension recreated them after a\n"
+            "  delete. They appear in the panel and load nothing. Type 'ghosts' to select them."
+        )
+    if notes:
+        print("\n" + "\n".join(notes))
+
+    if args.list:
+        return 0
+
+    raw = input("\nDelete which? (numbers/ranges, 'ghosts', blank to cancel): ").strip()
+    if not raw:
+        print("Cancelled.")
+        return 0
+    picked = parse_selection(raw, rows)
+    if picked is None:
+        print("Unrecognised selection — nothing deleted.")
+        return 1
+
+    chosen = [rows[n - 1] for n in picked]
+    total = sum(r["bytes"] for r in chosen)
+    print(f"\nAbout to permanently delete {len(chosen)} session(s), {human(total)}:")
+    for r in chosen:
+        flag = "  <-- CURRENT SESSION" if r["id"] == live else ""
+        print(f"  {r['id'][:8]}  {r['title']}{flag}")
+    print(
+        "\nClose each of these in the Claude Code panel first. An open session is flushed\n"
+        "back to disk as a metadata-only file that reappears in the panel and loads nothing."
+    )
+    if input("\nType 'delete' to confirm: ").strip() != "delete":
+        print("Cancelled.")
+        return 0
+
+    deleted = []
+    for r in chosen:
+        try:
+            r["jsonl"].unlink()
+            if r["sidecar"].is_dir():
+                shutil.rmtree(r["sidecar"])
+            deleted.append(r)
+            print(f"deleted {r['id']}")
+        except OSError as exc:
+            print(f"FAILED {r['id']}: {exc}", file=sys.stderr)
+
+    recreated = [r for r in deleted if r["jsonl"].exists()]
+    if recreated:
+        print("\nThese came straight back — they are still open in the panel:")
+        for r in recreated:
+            print(f"  {r['id'][:8]}  {r['title']}")
+        print("  Close their tabs, reload the window, then run this again.")
+
+    app = None if args.no_reload or not deleted else vscode_app()
+    if app is None:
+        print("\nDone. Reload the VS Code window to refresh the session list.")
+        return 0
+
+    print(
+        "\nDone. Reloading the VS Code window to refresh the session list.\n"
+        "  This types into the command palette, so VS Code needs Accessibility\n"
+        "  permission (System Settings > Privacy & Security > Accessibility).\n"
+        f"  If nothing happens, check {RELOAD_LOG} and reload by hand."
+    )
+    sys.stdout.flush()
+    reload_window(*app)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

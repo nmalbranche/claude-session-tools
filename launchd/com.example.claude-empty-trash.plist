@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.example.claude-empty-trash</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>__HOME__/bin/claude-empty-trash</string>
+    <string>--purge-trash</string>
+  </array>
+  <!-- VS Code writes its state DB on quit; the interval covers a quit the watch misses. -->
+  <key>WatchPaths</key>
+  <array>
+    <string>__HOME__/Library/Application Support/Code/User/globalStorage/state.vscdb</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>300</integer>
+  <key>StandardOutPath</key>
+  <string>/dev/null</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/claude-empty-trash.err</string>
+</dict>
+</plist>
